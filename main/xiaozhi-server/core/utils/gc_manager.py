@@ -15,17 +15,20 @@ logger = setup_logging()
 class GlobalGCManager:
     """全局垃圾回收管理器"""
 
-    def __init__(self, interval_seconds=300):
+    def __init__(self, interval_seconds=300, full_gc_interval=6):
         """
         初始化GC管理器
 
         Args:
             interval_seconds: GC执行间隔（秒），默认300秒（5分钟）
+            full_gc_interval: 执行一次完整（第2代）GC的轮次间隔，默认6轮
         """
         self.interval_seconds = interval_seconds
+        self.full_gc_interval = max(1, int(full_gc_interval))
         self._task = None
         self._stop_event = asyncio.Event()
         self._lock = threading.Lock()
+        self._gc_round = 0
 
     async def start(self):
         """启动定时GC任务"""
@@ -33,7 +36,9 @@ class GlobalGCManager:
             logger.bind(tag=TAG).warning("GC管理器已经在运行")
             return
 
-        logger.bind(tag=TAG).info(f"启动全局GC管理器，间隔{self.interval_seconds}秒")
+        logger.bind(tag=TAG).info(
+            f"启动全局GC管理器，间隔{self.interval_seconds}秒，完整GC轮次={self.full_gc_interval}"
+        )
         self._stop_event.clear()
         self._task = asyncio.create_task(self._gc_loop())
 
@@ -88,15 +93,24 @@ class GlobalGCManager:
 
             def do_gc():
                 with self._lock:
-                    before = len(gc.get_objects())
-                    collected = gc.collect()
-                    after = len(gc.get_objects())
-                    return before, collected, after
+                    self._gc_round += 1
+                    generation = 0
+                    if self._gc_round % self.full_gc_interval == 0:
+                        generation = 2
+                    elif self._gc_round % 2 == 0:
+                        generation = 1
 
-            before, collected, after = await loop.run_in_executor(None, do_gc)
+                    before_count = gc.get_count()
+                    collected = gc.collect(generation)
+                    after_count = gc.get_count()
+                    return generation, before_count, collected, after_count
+
+            generation, before_count, collected, after_count = await loop.run_in_executor(
+                None, do_gc
+            )
             logger.bind(tag=TAG).debug(
-                f"全局GC执行完成 - 回收对象: {collected}, "
-                f"对象数量: {before} -> {after}"
+                f"全局GC执行完成(gen={generation}) - 回收对象: {collected}, "
+                f"count: {before_count} -> {after_count}"
             )
         except Exception as e:
             logger.bind(tag=TAG).error(f"执行GC时出错: {e}")
@@ -106,17 +120,18 @@ class GlobalGCManager:
 _gc_manager_instance = None
 
 
-def get_gc_manager(interval_seconds=300):
+def get_gc_manager(interval_seconds=300, full_gc_interval=6):
     """
     获取全局GC管理器实例（单例模式）
 
     Args:
         interval_seconds: GC执行间隔（秒），默认300秒（5分钟）
+        full_gc_interval: 执行一次完整（第2代）GC的轮次间隔，默认6轮
 
     Returns:
         GlobalGCManager实例
     """
     global _gc_manager_instance
     if _gc_manager_instance is None:
-        _gc_manager_instance = GlobalGCManager(interval_seconds)
+        _gc_manager_instance = GlobalGCManager(interval_seconds, full_gc_interval)
     return _gc_manager_instance
