@@ -85,6 +85,10 @@ class ASRProviderBase(ABC):
         """并行处理ASR和声纹识别"""
         try:
             total_start_time = time.monotonic()
+            
+            # 标记 ASR 开始
+            if hasattr(conn, 'latency_watch'):
+                conn.latency_watch.mark_asr_start()
 
             # 准备音频数据
             if conn.audio_format == "pcm":
@@ -162,6 +166,11 @@ class ASRProviderBase(ABC):
             # 性能监控
             total_time = time.monotonic() - total_start_time
             logger.bind(tag=TAG).debug(f"总处理耗时: {total_time:.3f}s")
+            
+            # 标记 ASR 结束
+            if hasattr(conn, 'latency_watch'):
+                asr_text = raw_text.get('content', '') if isinstance(raw_text, dict) else raw_text
+                conn.latency_watch.mark_asr_end(asr_text)
 
             # 检查文本长度
             text_len, _ = remove_punctuation_and_length(content_for_length_check)

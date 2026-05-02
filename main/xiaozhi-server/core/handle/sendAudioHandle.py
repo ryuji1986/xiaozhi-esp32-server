@@ -25,6 +25,10 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
     if conn.tts.tts_audio_first_sentence:
         conn.logger.bind(tag=TAG).info(f"发送第一段语音: {text}")
         conn.tts.tts_audio_first_sentence = False
+        
+        # 标记 TTS 开始
+        if hasattr(conn, 'latency_watch'):
+            conn.latency_watch.mark_tts_start()
 
     if sentenceType == SentenceType.FIRST:
         # 同一句子的后续消息加入流控队列，其他情况立即发送
@@ -49,6 +53,15 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
     # 发送结束消息（如果是最后一个文本）
     if sentenceType == SentenceType.LAST:
         await send_tts_message(conn, "stop", None)
+        
+        # 标记 TTS 结束
+        if hasattr(conn, 'latency_watch'):
+            conn.latency_watch.mark_tts_end()
+            
+        # 标记交互完成并打印耗时统计
+        if hasattr(conn, 'latency_watch'):
+            conn.latency_watch.mark_interaction_complete()
+        
         if conn.close_after_chat:
             await conn.close()
 

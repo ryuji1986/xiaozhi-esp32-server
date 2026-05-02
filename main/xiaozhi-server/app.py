@@ -44,7 +44,7 @@ async def monitor_stdin():
 
 
 async def main():
-    check_ffmpeg_installed()
+    # check_ffmpeg_installed()
     config = load_config()
 
     # auth_key优先级：配置文件server.auth_key > manager-api.secret > 自动生成

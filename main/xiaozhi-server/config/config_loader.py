@@ -6,7 +6,7 @@ from config.manage_api_client import init_service, get_server_config, get_agent_
 
 def get_project_dir():
     """获取项目根目录"""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/"
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def read_config(config_path):
@@ -24,8 +24,8 @@ def load_config():
     if cached_config is not None:
         return cached_config
 
-    default_config_path = get_project_dir() + "config.yaml"
-    custom_config_path = get_project_dir() + "data/.config.yaml"
+    default_config_path = os.path.join(get_project_dir(), "config.yaml")
+    custom_config_path = os.path.join(get_project_dir(), "data", ".config.yaml")
 
     # 加载默认配置
     default_config = read_config(default_config_path)

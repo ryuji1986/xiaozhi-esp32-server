@@ -42,6 +42,7 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
+from core.utils.latency_watch import LatencyWatch
 
 
 TAG = __name__
@@ -206,6 +207,9 @@ class ConnectionHandler:
 
         # 初始化提示词管理器
         self.prompt_manager = PromptManager(self.config, self.logger)
+        
+        # 初始化延迟监控器
+        self.latency_watch = LatencyWatch(self.session_id)
 
     async def handle_connection(self, ws: websockets.ServerConnection):
         try:
@@ -229,6 +233,9 @@ class ConnectionHandler:
 
             # 认证通过,继续处理
             self.websocket = ws
+            
+            # 标记 WebSocket 连接建立
+            self.latency_watch.mark_ws_connected()
 
             # 检查是否来自MQTT连接
             request_path = ws.request.path
@@ -964,6 +971,9 @@ class ConnectionHandler:
             self.dialogue.put(Message(role="user", content=tool_call_reminder, is_temporary=True))
 
         try:
+            # 标记 LLM 调用开始
+            self.latency_watch.mark_llm_start()
+            
             # 使用带记忆的对话
             memory_str = None
             # 仅当query非空（代表用户询问）时查询记忆
@@ -1163,6 +1173,9 @@ class ConnectionHandler:
             text_buff = "".join(response_message)
             self.tts.store_tts_text(current_sentence_id, text_buff)
             self.dialogue.put(Message(role="assistant", content=text_buff))
+            
+            # 标记 LLM 调用结束
+            self.latency_watch.mark_llm_end(len(text_buff))
 
             # 更新工具调用统计：如果没有调用工具，增加计数
             if depth == 0 and not tool_call_flag:
