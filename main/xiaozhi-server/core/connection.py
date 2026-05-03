@@ -213,6 +213,11 @@ class ConnectionHandler:
         # 初始化延迟监控器
         self.latency_watch = LatencyWatch(self.session_id)
 
+        # LLM/VLLM流式防失控保护（最小侵入）
+        self.llm_stream_max_chars = int(self.config.get("llm_stream_max_chars", 12000))
+        self.llm_tool_arguments_max_chars = int(self.config.get("llm_tool_arguments_max_chars", 8000))
+        self.llm_tool_calls_max_count = int(self.config.get("llm_tool_calls_max_count", 8))
+
     async def handle_connection(self, ws: websockets.ServerConnection):
         try:
             # 获取运行中的事件循环（必须在异步上下文中）
@@ -1049,7 +1054,7 @@ class ConnectionHandler:
                         content = response["content"]
                         tools_call = None
                     if content is not None and len(content) > 0:
-                        content_arguments += content
+                        content_arguments = self._safe_concat(content_arguments, content, self.llm_tool_arguments_max_chars)
 
                     if not tool_call_flag and content_arguments.startswith("<tool_call>"):
                         # print("content_arguments", content_arguments)
@@ -1071,7 +1076,7 @@ class ConnectionHandler:
 
                 if content is not None and len(content) > 0:
                     if not tool_call_flag:
-                        response_message.append(content)
+                        self._safe_append_text(response_message, content, self.llm_stream_max_chars)
                         self.tts.tts_text_queue.put(
                             TTSMessageDTO(
                                 sentence_id=current_sentence_id,
@@ -1120,10 +1125,10 @@ class ConnectionHandler:
                         )
                     except Exception as e:
                         bHasError = True
-                        response_message.append(a)
+                        self._safe_append_text(response_message, a, self.llm_stream_max_chars)
                 else:
                     bHasError = True
-                    response_message.append(content_arguments)
+                    self._safe_append_text(response_message, content_arguments, self.llm_stream_max_chars)
                 if bHasError:
                     self.logger.bind(tag=TAG).error(
                         f"function call error: {content_arguments}"
@@ -1544,6 +1549,28 @@ class ConnectionHandler:
         finally:
             self.logger.bind(tag=TAG).info("超时检查任务已退出")
 
+    def _safe_concat(self, base_text: str, new_text: str, max_chars: int) -> str:
+        if not new_text:
+            return base_text
+        remain = max_chars - len(base_text)
+        if remain <= 0:
+            return base_text
+        if len(new_text) > remain:
+            return base_text + new_text[:remain]
+        return base_text + new_text
+
+    def _safe_append_text(self, buffer_list: list, content: str, max_chars: int):
+        if not content:
+            return
+        current_len = sum(len(x) for x in buffer_list)
+        remain = max_chars - current_len
+        if remain <= 0:
+            return
+        if len(content) > remain:
+            buffer_list.append(content[:remain])
+        else:
+            buffer_list.append(content)
+
     def _merge_tool_calls(self, tool_calls_list, tools_call):
         """合并工具调用列表
 
@@ -1561,6 +1588,10 @@ class ConnectionHandler:
                     tool_index = len(tool_calls_list) - 1 if tool_calls_list else 0
 
             # 确保列表有足够的位置
+            if tool_index >= self.llm_tool_calls_max_count:
+                self.logger.bind(tag=TAG).warning(f"工具调用数量超限({self.llm_tool_calls_max_count})，忽略多余工具调用")
+                continue
+
             if tool_index >= len(tool_calls_list):
                 tool_calls_list.append({"id": "", "name": "", "arguments": ""})
 
@@ -1570,4 +1601,8 @@ class ConnectionHandler:
             if tool_call.function.name:
                 tool_calls_list[tool_index]["name"] = tool_call.function.name
             if tool_call.function.arguments:
-                tool_calls_list[tool_index]["arguments"] += tool_call.function.arguments
+                tool_calls_list[tool_index]["arguments"] = self._safe_concat(
+                    tool_calls_list[tool_index]["arguments"],
+                    tool_call.function.arguments,
+                    self.llm_tool_arguments_max_chars,
+                )
