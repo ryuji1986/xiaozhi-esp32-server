@@ -166,7 +166,9 @@ class ConnectionHandler:
         # 因为实际部署时可能会用到公共的本地ASR，不能把变量暴露给公共ASR
         # 所以涉及到ASR的变量，需要在这里定义，属于connection的私有变量
         self.asr_audio = []
-        self.asr_audio_queue = queue.Queue()
+        self.asr_audio_queue_maxsize = int(self.config.get("asr_audio_queue_maxsize", 100))
+        self.asr_audio_queue_drop_oldest = bool(self.config.get("asr_audio_queue_drop_oldest", True))
+        self.asr_audio_queue = queue.Queue(maxsize=self.asr_audio_queue_maxsize)
         self.current_speaker = None  # 存储当前说话人
 
         # llm相关变量
@@ -386,7 +388,7 @@ class ConnectionHandler:
                     return
 
             # 不需要头部处理或没有头部时，直接处理原始消息
-            self.asr_audio_queue.put(message)
+            self._enqueue_asr_audio(message)
 
     async def _process_mqtt_audio_message(self, message):
         """
@@ -413,13 +415,41 @@ class ConnectionHandler:
             elif len(message) > 16:
                 # 没有指定长度或长度无效，去掉头部后处理剩余数据
                 audio_data = message[16:]
-                self.asr_audio_queue.put(audio_data)
+                self._enqueue_asr_audio(audio_data)
                 return True
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"解析WebSocket音频包失败: {e}")
 
         # 处理失败，返回False表示需要继续处理
         return False
+
+
+    def _enqueue_asr_audio(self, audio_data: bytes):
+        """向 ASR 队列安全入队，支持有界队列与背压降载。"""
+        try:
+            self.asr_audio_queue.put_nowait(audio_data)
+            return
+        except queue.Full:
+            pass
+
+        if self.asr_audio_queue_drop_oldest:
+            try:
+                self.asr_audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.asr_audio_queue.put_nowait(audio_data)
+                self.logger.bind(tag=TAG).warning(
+                    f"ASR队列已满({self.asr_audio_queue_maxsize})，已丢弃最旧音频包进行背压"
+                )
+            except queue.Full:
+                self.logger.bind(tag=TAG).warning(
+                    f"ASR队列持续满载({self.asr_audio_queue_maxsize})，已丢弃当前音频包"
+                )
+        else:
+            self.logger.bind(tag=TAG).warning(
+                f"ASR队列已满({self.asr_audio_queue_maxsize})，已丢弃当前音频包"
+            )
 
     def _process_websocket_audio(self, audio_data, timestamp):
         """处理WebSocket格式的音频包"""
@@ -431,7 +461,7 @@ class ConnectionHandler:
 
         # 如果时间戳是递增的，直接处理
         if timestamp >= self.last_processed_timestamp:
-            self.asr_audio_queue.put(audio_data)
+            self._enqueue_asr_audio(audio_data)
             self.last_processed_timestamp = timestamp
 
             # 处理缓冲区中的后续包
@@ -441,7 +471,7 @@ class ConnectionHandler:
                 for ts in sorted(self.audio_timestamp_buffer.keys()):
                     if ts > self.last_processed_timestamp:
                         buffered_audio = self.audio_timestamp_buffer.pop(ts)
-                        self.asr_audio_queue.put(buffered_audio)
+                        self._enqueue_asr_audio(buffered_audio)
                         self.last_processed_timestamp = ts
                         processed_any = True
                         break
@@ -450,7 +480,7 @@ class ConnectionHandler:
             if len(self.audio_timestamp_buffer) < self.max_timestamp_buffer_size:
                 self.audio_timestamp_buffer[timestamp] = audio_data
             else:
-                self.asr_audio_queue.put(audio_data)
+                self._enqueue_asr_audio(audio_data)
 
     async def handle_restart(self, message):
         """处理服务器重启请求"""
