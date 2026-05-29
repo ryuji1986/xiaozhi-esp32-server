@@ -135,6 +135,8 @@ class OTAHandler(BaseHandler):
         server_config = self.config["server"]
         websocket_config = server_config.get("websocket", "")
 
+        self.logger.bind(tag=TAG).debug(f"_get_websocket_url server_config: {server_config}")
+
         if "你的" not in websocket_config:
             return websocket_config
         else:

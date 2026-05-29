@@ -1,4 +1,6 @@
 import asyncio
+import logging
+
 from aiohttp import web
 from config.logger import setup_logging
 from core.api.ota_handler import OTAHandler
