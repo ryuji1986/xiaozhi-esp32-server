@@ -166,7 +166,9 @@ class ConnectionHandler:
         # 因为实际部署时可能会用到公共的本地ASR，不能把变量暴露给公共ASR
         # 所以涉及到ASR的变量，需要在这里定义，属于connection的私有变量
         self.asr_audio = []
-        self.asr_audio_queue = queue.Queue()
+        self.asr_audio_queue_maxsize = int(self.config.get("asr_audio_queue_maxsize", 100))
+        self.asr_audio_queue_drop_oldest = bool(self.config.get("asr_audio_queue_drop_oldest", True))
+        self.asr_audio_queue = queue.Queue(maxsize=self.asr_audio_queue_maxsize)
         self.current_speaker = None  # 存储当前说话人
 
         # llm相关变量
@@ -210,6 +212,11 @@ class ConnectionHandler:
         
         # 初始化延迟监控器
         self.latency_watch = LatencyWatch(self.session_id)
+
+        # LLM/VLLM流式防失控保护（最小侵入）
+        self.llm_stream_max_chars = int(self.config.get("llm_stream_max_chars", 12000))
+        self.llm_tool_arguments_max_chars = int(self.config.get("llm_tool_arguments_max_chars", 8000))
+        self.llm_tool_calls_max_count = int(self.config.get("llm_tool_calls_max_count", 8))
 
     async def handle_connection(self, ws: websockets.ServerConnection):
         try:
@@ -386,7 +393,7 @@ class ConnectionHandler:
                     return
 
             # 不需要头部处理或没有头部时，直接处理原始消息
-            self.asr_audio_queue.put(message)
+            self._enqueue_asr_audio(message)
 
     async def _process_mqtt_audio_message(self, message):
         """
@@ -413,13 +420,41 @@ class ConnectionHandler:
             elif len(message) > 16:
                 # 没有指定长度或长度无效，去掉头部后处理剩余数据
                 audio_data = message[16:]
-                self.asr_audio_queue.put(audio_data)
+                self._enqueue_asr_audio(audio_data)
                 return True
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"解析WebSocket音频包失败: {e}")
 
         # 处理失败，返回False表示需要继续处理
         return False
+
+
+    def _enqueue_asr_audio(self, audio_data: bytes):
+        """向 ASR 队列安全入队，支持有界队列与背压降载。"""
+        try:
+            self.asr_audio_queue.put_nowait(audio_data)
+            return
+        except queue.Full:
+            pass
+
+        if self.asr_audio_queue_drop_oldest:
+            try:
+                self.asr_audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.asr_audio_queue.put_nowait(audio_data)
+                self.logger.bind(tag=TAG).warning(
+                    f"ASR队列已满({self.asr_audio_queue_maxsize})，已丢弃最旧音频包进行背压"
+                )
+            except queue.Full:
+                self.logger.bind(tag=TAG).warning(
+                    f"ASR队列持续满载({self.asr_audio_queue_maxsize})，已丢弃当前音频包"
+                )
+        else:
+            self.logger.bind(tag=TAG).warning(
+                f"ASR队列已满({self.asr_audio_queue_maxsize})，已丢弃当前音频包"
+            )
 
     def _process_websocket_audio(self, audio_data, timestamp):
         """处理WebSocket格式的音频包"""
@@ -431,7 +466,7 @@ class ConnectionHandler:
 
         # 如果时间戳是递增的，直接处理
         if timestamp >= self.last_processed_timestamp:
-            self.asr_audio_queue.put(audio_data)
+            self._enqueue_asr_audio(audio_data)
             self.last_processed_timestamp = timestamp
 
             # 处理缓冲区中的后续包
@@ -441,7 +476,7 @@ class ConnectionHandler:
                 for ts in sorted(self.audio_timestamp_buffer.keys()):
                     if ts > self.last_processed_timestamp:
                         buffered_audio = self.audio_timestamp_buffer.pop(ts)
-                        self.asr_audio_queue.put(buffered_audio)
+                        self._enqueue_asr_audio(buffered_audio)
                         self.last_processed_timestamp = ts
                         processed_any = True
                         break
@@ -450,7 +485,7 @@ class ConnectionHandler:
             if len(self.audio_timestamp_buffer) < self.max_timestamp_buffer_size:
                 self.audio_timestamp_buffer[timestamp] = audio_data
             else:
-                self.asr_audio_queue.put(audio_data)
+                self._enqueue_asr_audio(audio_data)
 
     async def handle_restart(self, message):
         """处理服务器重启请求"""
@@ -1019,7 +1054,7 @@ class ConnectionHandler:
                         content = response["content"]
                         tools_call = None
                     if content is not None and len(content) > 0:
-                        content_arguments += content
+                        content_arguments = self._safe_concat(content_arguments, content, self.llm_tool_arguments_max_chars)
 
                     if not tool_call_flag and content_arguments.startswith("<tool_call>"):
                         # print("content_arguments", content_arguments)
@@ -1041,7 +1076,7 @@ class ConnectionHandler:
 
                 if content is not None and len(content) > 0:
                     if not tool_call_flag:
-                        response_message.append(content)
+                        self._safe_append_text(response_message, content, self.llm_stream_max_chars)
                         self.tts.tts_text_queue.put(
                             TTSMessageDTO(
                                 sentence_id=current_sentence_id,
@@ -1090,10 +1125,10 @@ class ConnectionHandler:
                         )
                     except Exception as e:
                         bHasError = True
-                        response_message.append(a)
+                        self._safe_append_text(response_message, a, self.llm_stream_max_chars)
                 else:
                     bHasError = True
-                    response_message.append(content_arguments)
+                    self._safe_append_text(response_message, content_arguments, self.llm_stream_max_chars)
                 if bHasError:
                     self.logger.bind(tag=TAG).error(
                         f"function call error: {content_arguments}"
@@ -1514,6 +1549,28 @@ class ConnectionHandler:
         finally:
             self.logger.bind(tag=TAG).info("超时检查任务已退出")
 
+    def _safe_concat(self, base_text: str, new_text: str, max_chars: int) -> str:
+        if not new_text:
+            return base_text
+        remain = max_chars - len(base_text)
+        if remain <= 0:
+            return base_text
+        if len(new_text) > remain:
+            return base_text + new_text[:remain]
+        return base_text + new_text
+
+    def _safe_append_text(self, buffer_list: list, content: str, max_chars: int):
+        if not content:
+            return
+        current_len = sum(len(x) for x in buffer_list)
+        remain = max_chars - current_len
+        if remain <= 0:
+            return
+        if len(content) > remain:
+            buffer_list.append(content[:remain])
+        else:
+            buffer_list.append(content)
+
     def _merge_tool_calls(self, tool_calls_list, tools_call):
         """合并工具调用列表
 
@@ -1531,6 +1588,10 @@ class ConnectionHandler:
                     tool_index = len(tool_calls_list) - 1 if tool_calls_list else 0
 
             # 确保列表有足够的位置
+            if tool_index >= self.llm_tool_calls_max_count:
+                self.logger.bind(tag=TAG).warning(f"工具调用数量超限({self.llm_tool_calls_max_count})，忽略多余工具调用")
+                continue
+
             if tool_index >= len(tool_calls_list):
                 tool_calls_list.append({"id": "", "name": "", "arguments": ""})
 
@@ -1540,4 +1601,8 @@ class ConnectionHandler:
             if tool_call.function.name:
                 tool_calls_list[tool_index]["name"] = tool_call.function.name
             if tool_call.function.arguments:
-                tool_calls_list[tool_index]["arguments"] += tool_call.function.arguments
+                tool_calls_list[tool_index]["arguments"] = self._safe_concat(
+                    tool_calls_list[tool_index]["arguments"],
+                    tool_call.function.arguments,
+                    self.llm_tool_arguments_max_chars,
+                )

@@ -1,4 +1,5 @@
-import requests
+import asyncio
+import httpx
 from core.utils.util import check_model_key
 from core.providers.tts.base import TTSProviderBase
 from config.logger import setup_logging
@@ -11,6 +12,8 @@ class TTSProvider(TTSProviderBase):
     TTS_PARAM_CONFIG = [
         ("ttsRate", "speed", 0.25, 4, 1, lambda v: round(float(v), 2)),
     ]
+    _global_semaphore = None
+    _semaphore_lock = asyncio.Lock()
 
     def __init__(self, config, delete_audio_file):
         super().__init__(config, delete_audio_file)
@@ -23,17 +26,24 @@ class TTSProvider(TTSProviderBase):
             self.voice = config.get("voice", "alloy")
         self.audio_file_type = config.get("format", "wav")
 
-        # 处理空字符串的情况
         speed = config.get("speed", "1.0")
         self.speed = float(speed) if speed else 1.0
 
-        # 应用百分比调整（如果存在），否则使用公有化配置
         self._apply_percentage_params(config)
 
         self.output_file = config.get("output_dir", "tmp/")
+        self.request_timeout = float(config.get("request_timeout", 30))
+        self.max_concurrency = int(config.get("max_concurrency", 64))
         model_key_msg = check_model_key("TTS", self.api_key)
         if model_key_msg:
             logger.bind(tag=TAG).error(model_key_msg)
+
+    async def _get_semaphore(self):
+        if TTSProvider._global_semaphore is None:
+            async with TTSProvider._semaphore_lock:
+                if TTSProvider._global_semaphore is None:
+                    TTSProvider._global_semaphore = asyncio.Semaphore(self.max_concurrency)
+        return TTSProvider._global_semaphore
 
     async def text_to_speak(self, text, output_file):
         headers = {
@@ -47,14 +57,18 @@ class TTSProvider(TTSProviderBase):
             "response_format": self.audio_file_type,
             "speed": self.speed,
         }
-        response = requests.post(self.api_url, json=data, headers=headers)
+        timeout = httpx.Timeout(self.request_timeout)
+        semaphore = await self._get_semaphore()
+
+        async with semaphore:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(self.api_url, json=data, headers=headers)
+
         if response.status_code == 200:
             if output_file:
                 with open(output_file, "wb") as audio_file:
                     audio_file.write(response.content)
-            else:
-                return response.content
-        else:
-            raise Exception(
-                f"OpenAI TTS请求失败: {response.status_code} - {response.text}"
-            )
+                return None
+            return response.content
+
+        raise Exception(f"OpenAI TTS请求失败: {response.status_code} - {response.text}")
